@@ -70,6 +70,13 @@ TAXILA_KNOWLEDGE_BASE = {
 
 
 def get_env(name: str) -> str:
+    session_key = f"ui_{name.lower()}"
+    try:
+        session_value = st.session_state.get(session_key, "")
+        if session_value:
+            return str(session_value).strip()
+    except Exception:
+        pass
     env_value = os.getenv(name, "").strip()
     if env_value:
         return env_value
@@ -239,7 +246,7 @@ def extract_ocr_text(result) -> str:
 
 
 def hf_glm_ocr_page(pdf_path: Path, page_number: int) -> str:
-    client = get_hf_client()
+    client = get_hf_client(get_env("HF_TOKEN"))
     if client is None:
         return ""
 
@@ -335,8 +342,7 @@ def load_book_chunks(use_ai_ocr: bool = False) -> list[dict]:
 
 
 @st.cache_resource
-def get_hf_client() -> InferenceClient | None:
-    api_key = get_env("HF_TOKEN")
+def get_hf_client(api_key: str) -> InferenceClient | None:
     if not api_key:
         return None
     return InferenceClient(api_key=api_key, provider="hf-inference")
@@ -351,8 +357,7 @@ def has_groq_client() -> bool:
 
 
 @st.cache_data(show_spinner=False, ttl=600)
-def validate_groq_key() -> tuple[bool, str]:
-    api_key = get_env("GROQ_API_KEY")
+def validate_groq_key(api_key: str) -> tuple[bool, str]:
     if not api_key:
         return False, "missing"
     try:
@@ -369,8 +374,7 @@ def validate_groq_key() -> tuple[bool, str]:
 
 
 @st.cache_data(show_spinner=False, ttl=600)
-def validate_hf_key() -> tuple[bool, str]:
-    api_key = get_env("HF_TOKEN")
+def validate_hf_key(api_key: str) -> tuple[bool, str]:
     if not api_key:
         return False, "missing"
     try:
@@ -443,7 +447,7 @@ def prepare_search_index() -> dict[str, int | bool | str]:
             "ocr_used": False,
         }
 
-    ocr_used = validate_hf_key()[0]
+    ocr_used = validate_hf_key(get_env("HF_TOKEN"))[0]
     chunks = load_book_chunks(use_ai_ocr=ocr_used)
     vector_index = build_vector_index(use_ai_ocr=ocr_used)
     return {
@@ -456,7 +460,7 @@ def prepare_search_index() -> dict[str, int | bool | str]:
 
 
 def retrieve_book_context(question: str, top_k: int = MAX_CONTEXT_CHUNKS) -> tuple[list[dict], str]:
-    use_ai_ocr = bool(get_hf_client())
+    use_ai_ocr = bool(get_hf_client(get_env("HF_TOKEN")))
     chunks = load_book_chunks(use_ai_ocr=use_ai_ocr)
     if not chunks:
         return [], "No PDF books were found in the books folder."
@@ -574,7 +578,7 @@ def groq_chat_completion(prompt: str) -> str:
 def generate_answer(question: str) -> tuple[str, list[dict], str]:
     context_chunks, retrieval_mode = retrieve_book_context(question)
 
-    groq_ok, groq_status = validate_groq_key()
+    groq_ok, groq_status = validate_groq_key(get_env("GROQ_API_KEY"))
     if not groq_ok:
         return fallback_answer(question, context_chunks), context_chunks, retrieval_mode
 
@@ -633,8 +637,8 @@ def build_image_prompt(question: str, answer: str, context_chunks: list[dict]) -
 
 
 def generate_image(question: str, answer: str, context_chunks: list[dict]):
-    hf_ok, hf_status = validate_hf_key()
-    client = get_hf_client()
+    hf_ok, hf_status = validate_hf_key(get_env("HF_TOKEN"))
+    client = get_hf_client(get_env("HF_TOKEN"))
     if client is None:
         return None, "HF_TOKEN is not configured, so image generation is disabled."
     if not hf_ok:
@@ -660,21 +664,50 @@ def generate_image(question: str, answer: str, context_chunks: list[dict]):
 st.title("🏛️ Heritage Site AI Chatbot & Image Generator")
 st.caption("Ask about Taxila using the loaded books and generate source-grounded archaeological concept art.")
 
+if "ui_groq_api_key" not in st.session_state:
+    st.session_state["ui_groq_api_key"] = ""
+if "ui_hf_token" not in st.session_state:
+    st.session_state["ui_hf_token"] = ""
+if "ui_groq_model" not in st.session_state:
+    st.session_state["ui_groq_model"] = get_env("GROQ_MODEL") or DEFAULT_GROQ_MODEL
+if "ui_hf_image_model" not in st.session_state:
+    st.session_state["ui_hf_image_model"] = get_env("HF_IMAGE_MODEL") or DEFAULT_HF_IMAGE_MODEL
+
 book_files = list_book_files()
-groq_ok, groq_status = validate_groq_key()
-hf_ok, hf_status = validate_hf_key()
+groq_ok, groq_status = validate_groq_key(get_env("GROQ_API_KEY"))
+hf_ok, hf_status = validate_hf_key(get_env("HF_TOKEN"))
 ocr_enabled = hf_ok
 
 with st.sidebar:
     st.subheader("Configuration")
+    st.text_input(
+        "Groq API key",
+        key="ui_groq_api_key",
+        type="password",
+        placeholder="Paste Groq key for this session",
+    )
+    st.text_input(
+        "Hugging Face token",
+        key="ui_hf_token",
+        type="password",
+        placeholder="Paste HF token for this session",
+    )
+    st.text_input(
+        "Groq model",
+        key="ui_groq_model",
+        placeholder=DEFAULT_GROQ_MODEL,
+    )
+    st.text_input(
+        "HF image model",
+        key="ui_hf_image_model",
+        placeholder=DEFAULT_HF_IMAGE_MODEL,
+    )
     st.write(f"Groq: {'configured' if groq_ok else 'not configured'}")
     if not groq_ok and has_groq_client():
         st.caption(f"Groq validation error: {groq_status}")
     st.write(f"Hugging Face: {'configured' if hf_ok else 'not configured'}")
-    if not hf_ok and get_hf_client():
+    if not hf_ok and get_hf_client(get_env("HF_TOKEN")):
         st.caption(f"Hugging Face validation error: {hf_status}")
-    st.text_input("Groq model", value=groq_model_name(), disabled=True)
-    st.text_input("HF image model", value=get_env("HF_IMAGE_MODEL") or DEFAULT_HF_IMAGE_MODEL, disabled=True)
 
     st.subheader("Book Context")
     if book_files:
