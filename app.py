@@ -10,6 +10,7 @@ import fitz
 import requests
 import streamlit as st
 from dotenv import load_dotenv
+from huggingface_hub import HfApi
 from huggingface_hub import InferenceClient
 from pypdf import PdfReader
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -27,7 +28,8 @@ st.set_page_config(
 
 BOOKS_DIR = Path("books")
 CACHE_DIR = Path(".cache")
-DEFAULT_HF_IMAGE_MODEL = "stabilityai/stable-diffusion-xl-base-1.0"
+CACHE_SCHEMA_VERSION = "v2"
+DEFAULT_HF_IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
 GLM_OCR_MODEL = "zai-org/GLM-OCR"
 DEFAULT_GROQ_MODEL = "llama-3.1-8b-instant"
 MAX_CONTEXT_CHUNKS = 5
@@ -73,9 +75,16 @@ def get_env(name: str) -> str:
         return env_value
     try:
         secret_value = st.secrets.get(name, "")
+        if secret_value:
+            return str(secret_value).strip()
+        for _, value in st.secrets.items():
+            if hasattr(value, "get"):
+                nested_value = value.get(name, "")
+                if nested_value:
+                    return str(nested_value).strip()
     except Exception:
-        secret_value = ""
-    return str(secret_value).strip()
+        pass
+    return ""
 
 
 def ensure_cache_dir() -> None:
@@ -88,6 +97,23 @@ def normalize_whitespace(text: str) -> str:
 
 def tokenize(text: str) -> set[str]:
     return set(re.findall(r"[a-zA-Z][a-zA-Z0-9'-]+", text.lower()))
+
+
+def is_good_source_text(text: str) -> bool:
+    normalized = text.lower()
+    blocked_phrases = [
+        "cornell university library",
+        "there are no known copyright restrictions",
+        "archive.org/details",
+        "digitized by",
+        "original of this book",
+    ]
+    if any(phrase in normalized for phrase in blocked_phrases):
+        return False
+    alpha_chars = sum(1 for char in text if char.isalpha())
+    if alpha_chars < 80:
+        return False
+    return True
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -245,7 +271,8 @@ def hf_glm_ocr_page(pdf_path: Path, page_number: int) -> str:
 
 
 def get_chunk_cache_name(use_ai_ocr: bool) -> str:
-    return "chunks_ocr.json" if use_ai_ocr else "chunks_text.json"
+    suffix = "ocr" if use_ai_ocr else "text"
+    return f"chunks_{suffix}_{CACHE_SCHEMA_VERSION}.json"
 
 
 def build_book_chunks(use_ai_ocr: bool = False) -> list[dict]:
@@ -259,6 +286,8 @@ def build_book_chunks(use_ai_ocr: bool = False) -> list[dict]:
             if not page_text:
                 continue
             for part_number, chunk_text in enumerate(split_text_into_chunks(page_text), start=1):
+                if not is_good_source_text(chunk_text):
+                    continue
                 chunks.append(
                     {
                         "book": pdf_path.name,
@@ -275,6 +304,8 @@ def load_cached_chunks(use_ai_ocr: bool) -> list[dict] | None:
     payload = read_json_file(get_cache_path(get_chunk_cache_name(use_ai_ocr)))
     if not payload:
         return None
+    if payload.get("cache_schema_version") != CACHE_SCHEMA_VERSION:
+        return None
     if payload.get("book_signature") != get_book_signature():
         return None
     return payload.get("chunks")
@@ -284,6 +315,7 @@ def save_chunk_cache(use_ai_ocr: bool, chunks: list[dict]) -> None:
     write_json_file(
         get_cache_path(get_chunk_cache_name(use_ai_ocr)),
         {
+            "cache_schema_version": CACHE_SCHEMA_VERSION,
             "book_signature": get_book_signature(),
             "use_ai_ocr": use_ai_ocr,
             "chunks": chunks,
@@ -307,7 +339,7 @@ def get_hf_client() -> InferenceClient | None:
     api_key = get_env("HF_TOKEN")
     if not api_key:
         return None
-    return InferenceClient(api_key=api_key)
+    return InferenceClient(api_key=api_key, provider="hf-inference")
 
 
 def groq_model_name() -> str:
@@ -318,14 +350,46 @@ def has_groq_client() -> bool:
     return bool(get_env("GROQ_API_KEY"))
 
 
+@st.cache_data(show_spinner=False, ttl=600)
+def validate_groq_key() -> tuple[bool, str]:
+    api_key = get_env("GROQ_API_KEY")
+    if not api_key:
+        return False, "missing"
+    try:
+        response = requests.get(
+            "https://api.groq.com/openai/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=30,
+        )
+        if response.ok:
+            return True, "ok"
+        return False, f"http {response.status_code}"
+    except Exception as exc:
+        return False, str(exc)
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def validate_hf_key() -> tuple[bool, str]:
+    api_key = get_env("HF_TOKEN")
+    if not api_key:
+        return False, "missing"
+    try:
+        HfApi(token=api_key).whoami()
+        return True, "ok"
+    except Exception as exc:
+        return False, str(exc)
+
+
 def get_vector_cache_name(use_ai_ocr: bool) -> str:
     suffix = "ocr" if use_ai_ocr else "text"
-    return f"tfidf_index_{suffix}.pkl"
+    return f"tfidf_index_{suffix}_{CACHE_SCHEMA_VERSION}.pkl"
 
 
 def load_cached_vector_index(use_ai_ocr: bool):
     payload = read_pickle_file(get_cache_path(get_vector_cache_name(use_ai_ocr)))
     if not payload:
+        return None
+    if payload.get("cache_schema_version") != CACHE_SCHEMA_VERSION:
         return None
     if payload.get("book_signature") != get_book_signature():
         return None
@@ -338,6 +402,7 @@ def save_vector_index(use_ai_ocr: bool, vectorizer: TfidfVectorizer, matrix) -> 
     write_pickle_file(
         get_cache_path(get_vector_cache_name(use_ai_ocr)),
         {
+            "cache_schema_version": CACHE_SCHEMA_VERSION,
             "book_signature": get_book_signature(),
             "use_ai_ocr": use_ai_ocr,
             "vectorizer": vectorizer,
@@ -378,7 +443,7 @@ def prepare_search_index() -> dict[str, int | bool | str]:
             "ocr_used": False,
         }
 
-    ocr_used = bool(get_hf_client())
+    ocr_used = validate_hf_key()[0]
     chunks = load_book_chunks(use_ai_ocr=ocr_used)
     vector_index = build_vector_index(use_ai_ocr=ocr_used)
     return {
@@ -509,7 +574,8 @@ def groq_chat_completion(prompt: str) -> str:
 def generate_answer(question: str) -> tuple[str, list[dict], str]:
     context_chunks, retrieval_mode = retrieve_book_context(question)
 
-    if not has_groq_client():
+    groq_ok, groq_status = validate_groq_key()
+    if not groq_ok:
         return fallback_answer(question, context_chunks), context_chunks, retrieval_mode
 
     prompt = dedent(
@@ -567,9 +633,12 @@ def build_image_prompt(question: str, answer: str, context_chunks: list[dict]) -
 
 
 def generate_image(question: str, answer: str, context_chunks: list[dict]):
+    hf_ok, hf_status = validate_hf_key()
     client = get_hf_client()
     if client is None:
         return None, "HF_TOKEN is not configured, so image generation is disabled."
+    if not hf_ok:
+        return None, f"Hugging Face token validation failed: {hf_status}"
 
     model_name = get_env("HF_IMAGE_MODEL") or DEFAULT_HF_IMAGE_MODEL
     prompt = build_image_prompt(question, answer, context_chunks)
@@ -592,12 +661,18 @@ st.title("🏛️ Heritage Site AI Chatbot & Image Generator")
 st.caption("Ask about Taxila using the loaded books and generate source-grounded archaeological concept art.")
 
 book_files = list_book_files()
-ocr_enabled = bool(get_hf_client())
+groq_ok, groq_status = validate_groq_key()
+hf_ok, hf_status = validate_hf_key()
+ocr_enabled = hf_ok
 
 with st.sidebar:
     st.subheader("Configuration")
-    st.write(f"Groq: {'configured' if has_groq_client() else 'not configured'}")
-    st.write(f"Hugging Face: {'configured' if get_hf_client() else 'not configured'}")
+    st.write(f"Groq: {'configured' if groq_ok else 'not configured'}")
+    if not groq_ok and has_groq_client():
+        st.caption(f"Groq validation error: {groq_status}")
+    st.write(f"Hugging Face: {'configured' if hf_ok else 'not configured'}")
+    if not hf_ok and get_hf_client():
+        st.caption(f"Hugging Face validation error: {hf_status}")
     st.text_input("Groq model", value=groq_model_name(), disabled=True)
     st.text_input("HF image model", value=get_env("HF_IMAGE_MODEL") or DEFAULT_HF_IMAGE_MODEL, disabled=True)
 
