@@ -39,6 +39,15 @@ GROQ_MODEL=llama-3.1-8b-instant
 HF_IMAGE_MODEL=black-forest-labs/FLUX.1-schnell
 ```
 
+For Streamlit Community Cloud, add the same keys in the app's **Secrets** settings:
+
+```toml
+GROQ_API_KEY = "your_key"
+HF_TOKEN = "your_token"
+GROQ_MODEL = "llama-3.1-8b-instant"
+HF_IMAGE_MODEL = "stabilityai/stable-diffusion-xl-base-1.0"
+```
+
 Optional:
 
 ```powershell
@@ -63,4 +72,3 @@ streamlit run app.py
 - Prepared search data is stored in `.cache/` and automatically reused until the source PDFs change.
 - Answers prioritize retrieved excerpts from the books and include source references for the passages used.
 - Generated images are prompted with factual details pulled from the retrieved book excerpts so they are more useful as archaeological concept references.
-

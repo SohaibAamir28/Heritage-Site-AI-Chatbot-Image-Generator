@@ -68,7 +68,14 @@ TAXILA_KNOWLEDGE_BASE = {
 
 
 def get_env(name: str) -> str:
-    return os.getenv(name, "").strip()
+    env_value = os.getenv(name, "").strip()
+    if env_value:
+        return env_value
+    try:
+        secret_value = st.secrets.get(name, "")
+    except Exception:
+        secret_value = ""
+    return str(secret_value).strip()
 
 
 def ensure_cache_dir() -> None:
